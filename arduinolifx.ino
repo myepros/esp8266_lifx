@@ -18,6 +18,26 @@
  Made possible by the work of magicmonkey:
  https://github.com/magicmonkey/lifxjs/ - you can use this to control
  your arduino bulb as well as real LIFX bulbs at the same time!
+/*
+ LIFX bulb emulator by Kayne Richens (kayno@kayno.net)
+
+ Emulates a LIFX bulb. Connect an RGB LED (or LED strip via drivers)
+ to redPin, greenPin and bluePin as you normally would on an
+ ethernet-ready Arduino and control it from the LIFX app!
+
+ Notes:
+ - Only one client (e.g. app) can connect to the bulb at once
+
+ Set the following variables below to suit your Arduino and network
+ environment:
+ - mac (unique mac address for your arduino)
+ - redPin (PWM pin for RED)
+ - greenPin  (PWM pin for GREEN)
+ - bluePin  (PWM pin for BLUE)
+
+ Made possible by the work of magicmonkey:
+ https://github.com/magicmonkey/lifxjs/ - you can use this to control
+ your arduino bulb as well as real LIFX bulbs at the same time!
 
  And also the RGBMood library by Harold Waterkeyn, which was modified
  slightly to support powering down the LED
@@ -27,13 +47,16 @@
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
-#include <LPD6803.h>
+#include <ESP8266TrueRandom.h>
+#include <time.h>
 #include <WiFiUDP.h>
 #include <WiFiManager.h>
 
 #include "lifx.h"
-//#include "RGBMoodLifx.h"
 #include "color.h"
+#include <NeoPixelBus.h>
+
+const uint16_t PixelCount = 60; // this example assumes 4 pixels, making it smaller will cause a failure
 
 // define to output debug messages (including packet dumps) to serial (38400 baud)
 #define DEBUG
@@ -46,23 +69,53 @@
  #define debug_println(x, ...)
 #endif
 
-// Enter a MAC address and IP address for your controller below.
-// The IP address will be dependent on your local network:
+#define WIFI_SSID "XXSSIDXX"
+#define WIFI_PASS "XXPASSXX"
+
+// mac address will be assigned the address fom the wifi adapter
+// this address is sent as a part of the protocol
 byte mac[] = {
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+  0xd0, 0x73, 0xd5, 0x2a, 0xbb, 0x8c
 };
 byte site_mac[] = {
   0x4c, 0x49, 0x46, 0x58, 0x56, 0x32
 }; // spells out "LIFXV2" - version 2 of the app changes the site address to this...
 
-// ldp6803
-#define LED_COUNT 1
-#define PIN_DATA  13
-#define PIN_CLOCK 14
-LPD6803 led_strip = LPD6803(LED_COUNT, PIN_DATA, PIN_CLOCK);
+// Dim curve
+// Used to make 'dimming' look more natural. 
+uint8_t dc1[256] = {
+    0,   1,   1,   2,   2,   2,   2,   2,   2,   3,   3,   3,   3,   3,   3,   3,
+    3,   3,   3,   3,   3,   3,   3,   4,   4,   4,   4,   4,   4,   4,   4,   4,
+    4,   4,   4,   5,   5,   5,   5,   5,   5,   5,   5,   5,   5,   6,   6,   6,
+    6,   6,   6,   6,   6,   7,   7,   7,   7,   7,   7,   7,   8,   8,   8,   8,
+    8,   8,   9,   9,   9,   9,   9,   9,   10,  10,  10,  10,  10,  11,  11,  11,
+    11,  11,  12,  12,  12,  12,  12,  13,  13,  13,  13,  14,  14,  14,  14,  15,
+    15,  15,  16,  16,  16,  16,  17,  17,  17,  18,  18,  18,  19,  19,  19,  20,
+    20,  20,  21,  21,  22,  22,  22,  23,  23,  24,  24,  25,  25,  25,  26,  26,
+    27,  27,  28,  28,  29,  29,  30,  30,  31,  32,  32,  33,  33,  34,  35,  35,
+    36,  36,  37,  38,  38,  39,  40,  40,  41,  42,  43,  43,  44,  45,  46,  47,
+    48,  48,  49,  50,  51,  52,  53,  54,  55,  56,  57,  58,  59,  60,  61,  62,
+    63,  64,  65,  66,  68,  69,  70,  71,  73,  74,  75,  76,  78,  79,  81,  82,
+    83,  85,  86,  88,  90,  91,  93,  94,  96,  98,  99,  101, 103, 105, 107, 109,
+    110, 112, 114, 116, 118, 121, 123, 125, 127, 129, 132, 134, 136, 139, 141, 144,
+    146, 149, 151, 154, 157, 159, 162, 165, 168, 171, 174, 177, 180, 183, 186, 190,
+    193, 196, 200, 203, 207, 211, 214, 218, 222, 226, 230, 234, 238, 242, 248, 255,
+};
+
+uint32_t LifxRxBytes = 0;
+uint32_t LifxTxBytes = 0;
+
+NeoPixelBus<NeoRgbwFeature, NeoEsp8266Dma800KbpsMethod> led_strip(PixelCount, 3);
+
+const char AP_SSID[] = "Lifx-2aBB8C";
 
 // label (name) for this bulb
-char bulbLabel[LifxBulbLabelLength] = "LED lamp";
+char bulbLabel[LifxBulbLabelLength] = "";
+LifxLocationData bulbLocation;
+LifxGroupData bulbGroup;
+LifxUnknownData unknownData;
+
+uint16_t LifxPowerLevel = 0;
 
 // tags for this bulb
 char bulbTags[LifxBulbTagsLength] = {
@@ -83,13 +136,12 @@ WiFiUDP Udp;
 WiFiServer TcpServer(LifxPort);
 WiFiClient client;
 
-/*
- * If no knwon network was found, change to access point mode.
- * Color = All red
- */
-void configModeCallback () {
-  debug_println("Entered config mode");
-  debug_println(WiFi.softAPIP());
+//gets called when WiFiManager enters configuration mode
+void configModeCallback (WiFiManager *myWiFiManager) {
+  Serial.println("Entered config mode");
+  Serial.println(WiFi.softAPIP());
+  //if you used auto generated SSID, print it
+  Serial.println(myWiFiManager->getConfigPortalSSID());
 }
 
 /*
@@ -101,17 +153,42 @@ void connectingSuccess() {
   Serial.print ("IP address: ");
   Serial.println (WiFi.localIP());
 
-  led_strip.setPixelColor (0, 0, 255, 0);
-  led_strip.show ();
+  led_strip.ClearTo(RgbwColor(0, 255, 0, 0));
+  led_strip.Show ();
   delay(500);
-  led_strip.setPixelColor (0, 0, 0, 0);
-  led_strip.show ();
+  led_strip.ClearTo(RgbwColor(0, 0, 0, 0));
+  led_strip.Show ();
   delay(500);
-  led_strip.setPixelColor (0, 0, 255, 0);
-  led_strip.show ();
+  led_strip.ClearTo(RgbwColor(0, 255, 0, 0));
+  led_strip.Show ();
   delay(500);
-  led_strip.setPixelColor (0, 0, 0, 0);
-  led_strip.show ();
+  led_strip.ClearTo(RgbwColor(0, 0, 0, 0));
+  led_strip.Show ();
+}
+
+void wifiSetup() {
+
+	wifi_set_macaddr(STATION_IF, &mac[0]);
+
+    // Set WIFI module to STA mode
+    WiFi.mode(WIFI_STA);
+
+    // Connect
+    Serial.printf("[WIFI] Connecting to %s ", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    // Wait
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+
+    // Connected!
+    Serial.printf("[WIFI] STATION Mode, SSID: %s, IP address: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+    // Get mac address
+    WiFi.macAddress(mac);
 }
 
 void setup() {
@@ -119,34 +196,51 @@ void setup() {
   Serial.begin(115200);
   debug_println(F("LIFX bulb emulator for Esp8266 starting up..."));
 
-  // WIFI
+  // WIFI1
+#if 0
+    // Wifi
+    wifiSetup();
+#else
   WiFiManager wifiManager;
-  wifiManager.setDebugOutput(false);
+  wifiManager.setDebugOutput(true);
   wifiManager.setAPCallback(configModeCallback);
   
-  if (!wifiManager.autoConnect(bulbLabel)) {
+  if (!wifiManager.autoConnect(AP_SSID)) {
     debug_println("failed to connect and hit timeout");
     //reset and try again, or maybe put it to deep sleep
     ESP.reset();
     delay(1000);
   }
+#endif
 
+  configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("\nWaiting for time");
+  while (!time(nullptr)) {
+    Serial.print(".");
+    delay(1000);
+  }
+  
   // LEDS
-  led_strip.begin();
-  led_strip.setPixelColor(0, 0, 0, 255);
-  led_strip.show();
+  led_strip.Begin();
+  led_strip.ClearTo(RgbwColor(0, 0, 0, 255));
+  led_strip.Show();
   debug_println("LEDS initalized");
   
   // Connecting is succeeded
   connectingSuccess();
  
-  // Set mac address
-  WiFi.macAddress(mac);
-
   // set up a UDP and TCP port ready for incoming
   Udp.begin(LifxPort);
   TcpServer.begin();
+  EEPROM.begin(256);
 
+  debug_println(F("EEPROM dump:"));
+  for (int i = 0; i < 256; i++) {
+    debug_print(EEPROM.read(i));
+    debug_print(SPACE);
+  }
+  debug_println();
+  
   // read in settings from EEPROM (if they exist) for bulb label and tags
   if (EEPROM.read(EEPROM_CONFIG_START) == EEPROM_CONFIG[0]
       && EEPROM.read(EEPROM_CONFIG_START + 1) == EEPROM_CONFIG[1]
@@ -175,6 +269,16 @@ void setup() {
       debug_print(bulbTagLabels[i]);
     }
 
+	for (int i = 0; i < sizeof(LifxLocationData); i++) {
+      bulbLocation.lx_raw.data[i] = EEPROM.read(EEPROM_BULB_LOCATION_START + i);
+      debug_print(bulbLocation.lx_raw.data[i]);
+    }
+
+	for (int i = 0; i < sizeof(LifxGroupData); i++) {
+      bulbGroup.lx_raw.data[i] = EEPROM.read(EEPROM_BULB_GROUP_START + i);
+      debug_print(bulbGroup.lx_raw.data[i]);
+    }
+	
     debug_println();
     debug_println(F("Done reading EEPROM config."));
   } else {
@@ -185,6 +289,7 @@ void setup() {
     EEPROM.write(EEPROM_CONFIG_START + 1, EEPROM_CONFIG[1]);
     EEPROM.write(EEPROM_CONFIG_START + 2, EEPROM_CONFIG[2]);
 
+	memset(bulbLabel, 0, sizeof(bulbLabel));
     for (int i = 0; i < LifxBulbLabelLength; i++) {
       EEPROM.write(EEPROM_BULB_LABEL_START + i, bulbLabel[i]);
     }
@@ -196,10 +301,25 @@ void setup() {
     for (int i = 0; i < LifxBulbTagLabelsLength; i++) {
       EEPROM.write(EEPROM_BULB_TAG_LABELS_START + i, bulbTagLabels[i]);
     }
+    
+	//ESP8266TrueRandom.uuid(bulbLocation.lx_location.location);
+	memset(bulbLocation.lx_location.location, 0, 16);
+	memset(bulbLocation.lx_location.label, 0, sizeof(bulbLocation.lx_location.label));
+	for (int i = 0; i < sizeof(LifxLocationData); i++) {
+      EEPROM.write(EEPROM_BULB_LOCATION_START + i, bulbLocation.lx_raw.data[i]);
+    }
 
+	//ESP8266TrueRandom.uuid(bulbGroup.lx_group.location);
+	memset(bulbGroup.lx_group.group, 0, 16);
+	memset(bulbGroup.lx_group.label, 0, sizeof(bulbGroup.lx_group.label));
+	for (int i = 0; i < sizeof(LifxGroupData); i++) {
+      EEPROM.write(EEPROM_BULB_GROUP_START + i, bulbGroup.lx_raw.data[i]);
+    }
+
+	memset(unknownData.lx_raw.data, 0, sizeof(LifxUnknownData));
     debug_println(F("Done writing EEPROM config."));
   }
-
+  EEPROM.commit();
   debug_println(F("EEPROM dump:"));
   for (int i = 0; i < 256; i++) {
     debug_print(EEPROM.read(i));
@@ -212,7 +332,7 @@ void setup() {
 }
 
 void loop() {
-  if (led_strip.outputReady ())
+  if (1)
   {
     // buffers for receiving and sending data
     byte PacketBuffer[128]; //buffer to hold incoming packet,
@@ -228,12 +348,12 @@ void loop() {
       }
 
       debug_print(F("-TCP "));
-      for (int i = 0; i < LifxPacketSize; i++) {
+      for (int i = 0; i < LifxHeaderSize; i++) {
         debug_print(PacketBuffer[i], HEX);
         debug_print(SPACE);
       }
 
-      for (int i = LifxPacketSize; i < packetSize; i++) {
+      for (int i = LifxHeaderSize; i < packetSize; i++) {
         debug_print(PacketBuffer[i], HEX);
         debug_print(SPACE);
       }
@@ -253,12 +373,12 @@ void loop() {
       Udp.read(PacketBuffer, 128);
 
       debug_print(F("-UDP "));
-      for (int i = 0; i < LifxPacketSize; i++) {
+      for (int i = 0; i < LifxHeaderSize; i++) {
         debug_print(PacketBuffer[i], HEX);
         debug_print(SPACE);
       }
 
-      for (int i = LifxPacketSize; i < packetSize; i++) {
+      for (int i = LifxHeaderSize; i < packetSize; i++) {
         debug_print(PacketBuffer[i], HEX);
         debug_print(SPACE);
       }
@@ -279,370 +399,314 @@ void loop() {
 
 void processRequest(byte *packetBuffer, int packetSize, LifxPacket &request) {
 
-  request.size        = packetBuffer[0] + (packetBuffer[1] << 8); //little endian
-  request.protocol    = packetBuffer[2] + (packetBuffer[3] << 8); //little endian
-  request.reserved1   = packetBuffer[4] + packetBuffer[5] + packetBuffer[6] + packetBuffer[7];
-
-  byte bulbAddress[] = {
-    packetBuffer[8], packetBuffer[9], packetBuffer[10], packetBuffer[11], packetBuffer[12], packetBuffer[13]
-  };
-  memcpy(request.bulbAddress, bulbAddress, 6);
-
-  request.reserved2   = packetBuffer[14] + packetBuffer[15];
-
-  byte site[] = {
-    packetBuffer[16], packetBuffer[17], packetBuffer[18], packetBuffer[19], packetBuffer[20], packetBuffer[21]
-  };
-  memcpy(request.site, site, 6);
-
-  request.reserved3   = packetBuffer[22] + packetBuffer[23];
-  request.timestamp   = packetBuffer[24] + packetBuffer[25] + packetBuffer[26] + packetBuffer[27] +
-                        packetBuffer[28] + packetBuffer[29] + packetBuffer[30] + packetBuffer[31];
-  request.packet_type = packetBuffer[32] + (packetBuffer[33] << 8); //little endian
-  request.reserved4   = packetBuffer[34] + packetBuffer[35];
-
-  int i;
-  for (i = LifxPacketSize; i < packetSize; i++) {
-    request.data[i - LifxPacketSize] = packetBuffer[i];
-  }
-
-  request.data_size = i;
+	packetSize = (packetSize < sizeof(request.lx_raw.data)) ? packetSize : sizeof(request.lx_raw.data);
+	memcpy(&request.lx_raw.data, packetBuffer, packetSize);
 }
 
 void handleRequest(LifxPacket &request) {
-  debug_print(F("  Received packet type "));
-  debug_println(request.packet_type, HEX);
+	debug_print(F("  Received packet type "));
+	debug_println(request.lx_protocol_header.type, DEC);
+	if(request.lx_protocol_header.ack_required)
+	{
+		debug_println("ACK Required");
+	}
+	LifxRxBytes += request.lx_protocol_header.size;
+	
+	LifxPacket response;
+	memset( response.lx_raw.data, 0, sizeof(response.lx_raw.data));
 
-  LifxPacket response;
-  switch (request.packet_type) {
+	response.lx_protocol_header.protocol = 1024;
+	response.lx_protocol_header.addressable = 1;
+	response.lx_protocol_header.tagged = 0;
+	response.lx_protocol_header.origin = 0;
+	response.lx_protocol_header.source = request.lx_protocol_header.source;
+	memcpy(response.lx_protocol_header.target, mac, 6);
+	memcpy(response.lx_protocol_header.site_mac, site_mac, 6);
+	response.lx_protocol_header.res_required = 0;
+	response.lx_protocol_header.ack_required = 0;
+	response.lx_protocol_header.sequence = request.lx_protocol_header.sequence + 1;
+	response.lx_protocol_header.timestamp = time(nullptr) & 0xffffffffffffffc0;
+	
+	LifxPowerData *ppData;
+	LifxLabelData *plData;
+	LifxLocationData *plocData;
+	LifxGroupData *pgrpData;
+	LifxLightColorData *pscData;
+	LifxLightSetPowerData *plspData;
+	LifxUnknownData *puData;
+	LifxLightWaveformOptionalData *pwoData;
+	
+	switch (request.lx_protocol_header.type) {
 
-    case GET_PAN_GATEWAY:
-      {
-        // we are a gateway, so respond to this
+		case GET_SERVICE:
+			response.lx_protocol_header.origin = 1;
+			response.lx_protocol_header.type = STATE_SEVICE;
+			response.lx_protocol_header.source = 0x05c028e7;
+			LifxServiceData ssData;
+			// respond with the UDP port
+			ssData.lx_service.service = SERVICE_UDP;
+			ssData.lx_service.port = LifxPort;
+			memcpy(response.lx_protocol_header.data, ssData.lx_raw.data, sizeof(LifxServiceData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxServiceData);
+			sendPacket(response);
 
-        // respond with the UDP port
-        response.packet_type = PAN_GATEWAY;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        byte UDPdata[] = {
-          SERVICE_UDP, //UDP
-          lowByte(LifxPort),
-          highByte(LifxPort),
-          0x00,
-          0x00
-        };
+			ssData.lx_service.service = SERVICE_UNKNOWN;
+			memcpy(response.lx_protocol_header.data, ssData.lx_raw.data, sizeof(LifxServiceData));
+			sendPacket(response);
+			break;
 
-        memcpy(response.data, UDPdata, sizeof(UDPdata));
-        response.data_size = sizeof(UDPdata);
-        sendPacket(response);
+		case GET_HOST_INFO:
+			response.lx_protocol_header.type = STATE_HOST_INFO;
+			
+			LifxHostInfoData hiData;
+			memset(&hiData, 0, sizeof(hiData));
+			hiData.lx_host_info.signal = 1;		// rx signal in mW
+			hiData.lx_host_info.tx = LifxTxBytes;
+			hiData.lx_host_info.rx = LifxRxBytes;
+			memcpy(response.lx_protocol_header.data, hiData.lx_raw.data, sizeof(LifxHostInfoData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxHostInfoData);
+			sendPacket(response);			
+			break;
 
-        // respond with the TCP port details
-        response.packet_type = PAN_GATEWAY;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        byte TCPdata[] = {
-          SERVICE_TCP, //TCP
-          lowByte(LifxPort),
-          highByte(LifxPort),
-          0x00,
-          0x00
-        };
+		case GET_HOST_FIRMWARE:
+			response.lx_protocol_header.type = STATE_HOST_FIRMWARE;
 
-        memcpy(response.data, TCPdata, sizeof(TCPdata));
-        response.data_size = sizeof(TCPdata);
-        sendPacket(response);
+			LifxHostFirmwareData hfData;
+			memset(&hfData, 0, sizeof(hfData));
+			hfData.lx_host_fimware.build1 = 0x149274518f14ea00;		// epoc build time
+			hfData.lx_host_fimware.build2 = 0x149274518f14ea00;		// epoc build time
+			hfData.lx_host_fimware.version = (LifxFirmwareVersionMajor << 16) + LifxFirmwareVersionMinor;
+			memcpy(response.lx_protocol_header.data, hfData.lx_raw.data, sizeof(LifxHostFirmwareData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxHostFirmwareData);
+			sendPacket(response);			
+			break;
 
-      }
-      break;
+		case GET_WIFI_INFO:
+			response.lx_protocol_header.type = STATE_WIFI_INFO;
+			
+			LifxWifiInfoData wiData;
+			memset(&wiData, 0, sizeof(wiData));
+			wiData.lx_wifi_info.signal = 1;		// rx signal in mW
+			wiData.lx_wifi_info.tx = LifxTxBytes;
+			wiData.lx_wifi_info.rx = LifxRxBytes;
+			memcpy(response.lx_protocol_header.data, wiData.lx_raw.data, sizeof(LifxWifiInfoData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxWifiInfoData);
+			sendPacket(response);			
+			break;
 
+		case GET_WIFI_FIRMWARE:
+			response.lx_protocol_header.type = STATE_WIFI_FIRMWARE;
 
-    case SET_LIGHT_STATE:
-      {
-        // set the light colors
-        hue = word(request.data[2], request.data[1]);
-        sat = word(request.data[4], request.data[3]);
-        bri = word(request.data[6], request.data[5]);
-        kel = word(request.data[8], request.data[7]);
+			LifxWifiFirmwareData wfData;
+			memset(&wfData, 0, sizeof(wfData));
+			wfData.lx_wifi_fimware.build1 = 0x149274518f14ea00;		// epoc build time
+			wfData.lx_wifi_fimware.build2 = 0x149274518f14ea00;		// epoc build time
+			wfData.lx_wifi_fimware.version = (LifxFirmwareVersionMajor << 16) + LifxFirmwareVersionMinor;
+			memcpy(response.lx_protocol_header.data, wfData.lx_raw.data, sizeof(LifxWifiFirmwareData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxWifiFirmwareData);
+			sendPacket(response);			
+			break;
 
-        for(int i=0; i<request.data_size; i++){
-          debug_print(request.data[i], HEX);
-          debug_print(SPACE);
-        }
-        debug_println();
+		case SET_POWER:
+			ppData = (LifxPowerData *)(&request.lx_protocol_header.data[0]);
+			LifxPowerLevel = ppData->lx_power.level;
+			EEPROM.commit();
+			if(!request.lx_protocol_header.res_required) return;
+		case GET_POWER:
+			response.lx_protocol_header.type = STATE_POWER;
 
-        setLight();
-      }
-      break;
+			LifxPowerData pData;
+			memset(&pData, 0, sizeof(pData));
+			pData.lx_power.level = LifxPowerLevel;
+			memcpy(response.lx_protocol_header.data, pData.lx_raw.data, sizeof(LifxPowerData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxPowerData);
+			sendPacket(response);			
+			break;
 
+		case SET_LABEL:
+			plData = (LifxLabelData *)(request.lx_protocol_header.data);
+			for (int i = 0; i < LifxBulbLabelLength; i++) {
+				if (bulbLabel[i] != plData->lx_label.label[i]) {
+					bulbLabel[i] = plData->lx_label.label[i];
+					EEPROM.write(EEPROM_BULB_LABEL_START + i, bulbLabel[i]);
+				}
+			}
+			EEPROM.commit();
+			if(!request.lx_protocol_header.res_required) return;
+		case GET_LABEL:
+			response.lx_protocol_header.type = STATE_LABEL;
 
-    case GET_LIGHT_STATE:
-      {
-        // send the light's state
-        response.packet_type = LIGHT_STATUS;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        byte StateData[] = {
-          lowByte(hue),  //hue
-          highByte(hue), //hue
-          lowByte(sat),  //sat
-          highByte(sat), //sat
-          lowByte(bri),  //bri
-          highByte(bri), //bri
-          lowByte(kel),  //kel
-          highByte(kel), //kel
-          lowByte(dim),  //dim
-          highByte(dim), //dim
-          lowByte(power_status),  //power status
-          highByte(power_status), //power status
-          // label
-          lowByte(bulbLabel[0]),
-          lowByte(bulbLabel[1]),
-          lowByte(bulbLabel[2]),
-          lowByte(bulbLabel[3]),
-          lowByte(bulbLabel[4]),
-          lowByte(bulbLabel[5]),
-          lowByte(bulbLabel[6]),
-          lowByte(bulbLabel[7]),
-          lowByte(bulbLabel[8]),
-          lowByte(bulbLabel[9]),
-          lowByte(bulbLabel[10]),
-          lowByte(bulbLabel[11]),
-          lowByte(bulbLabel[12]),
-          lowByte(bulbLabel[13]),
-          lowByte(bulbLabel[14]),
-          lowByte(bulbLabel[15]),
-          lowByte(bulbLabel[16]),
-          lowByte(bulbLabel[17]),
-          lowByte(bulbLabel[18]),
-          lowByte(bulbLabel[19]),
-          lowByte(bulbLabel[20]),
-          lowByte(bulbLabel[21]),
-          lowByte(bulbLabel[22]),
-          lowByte(bulbLabel[23]),
-          lowByte(bulbLabel[24]),
-          lowByte(bulbLabel[25]),
-          lowByte(bulbLabel[26]),
-          lowByte(bulbLabel[27]),
-          lowByte(bulbLabel[28]),
-          lowByte(bulbLabel[29]),
-          lowByte(bulbLabel[30]),
-          lowByte(bulbLabel[31]),
-          //tags
-          lowByte(bulbTags[0]),
-          lowByte(bulbTags[1]),
-          lowByte(bulbTags[2]),
-          lowByte(bulbTags[3]),
-          lowByte(bulbTags[4]),
-          lowByte(bulbTags[5]),
-          lowByte(bulbTags[6]),
-          lowByte(bulbTags[7])
-        };
+			LifxLabelData lData;
+			memset(&lData, 0, sizeof(lData));
+			memcpy(lData.lx_label.label, bulbLabel, LifxBulbLabelLength);
+			memcpy(response.lx_protocol_header.data, lData.lx_raw.data, sizeof(LifxLabelData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxLabelData);
+			sendPacket(response);				
+			break;
 
-        memcpy(response.data, StateData, sizeof(StateData));
-        response.data_size = sizeof(StateData);
-        sendPacket(response);
-      }
-      break;
+		case GET_VERSION:
+			response.lx_protocol_header.type = STATE_VERSION;
 
+			LifxVersionData vData;
+			memset(&vData, 0, sizeof(vData));
+			vData.lx_version.vendor = LifxBulbVendor;
+			vData.lx_version.product = LifxBulbProduct;
+			vData.lx_version.version = LifxBulbVersion;
+			memcpy(response.lx_protocol_header.data, vData.lx_raw.data, sizeof(LifxVersionData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxVersionData);
+			sendPacket(response);			
+			break;			
 
-    case SET_POWER_STATE:
-    case SET_POWER_STATE2:
-    case GET_POWER_STATE:
-    case GET_POWER_STATE2:
-      {
-        // set if we are setting
-        if (request.packet_type == SET_POWER_STATE | request.packet_type == SET_POWER_STATE2) {
-          power_status = word(request.data[1], request.data[0]);
-          setLight();
-        }
+		case GET_INFO:
+			response.lx_protocol_header.type = STATE_INFO;
 
-        // respond to both get and set commands
-        response.packet_type = POWER_STATE;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        byte PowerData[] = {
-          lowByte(power_status),
-          highByte(power_status)
-        };
+			LifxInfoData iData;
+			memset(&iData, 0, sizeof(iData));
+			iData.lx_info.time = 0;
+			iData.lx_info.uptime = 0;
+			iData.lx_info.downtime = 0;
+			memcpy(response.lx_protocol_header.data, iData.lx_raw.data, sizeof(LifxInfoData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxInfoData);
+			sendPacket(response);				
+			break;
 
-        memcpy(response.data, PowerData, sizeof(PowerData));
-        response.data_size = sizeof(PowerData);
-        sendPacket(response);
-      }
-      break;
+			//ACKNOWLEDGEMENT = 45;
 
+		case SET_LOCATION:
+			plocData = (LifxLocationData *)(request.lx_protocol_header.data);
+			
+			for (int i = 0; i < sizeof(LifxLocationData); i++) {
+				if (bulbLocation.lx_raw.data[i] != plocData->lx_raw.data[i]) {
+					bulbLocation.lx_raw.data[i] = plocData->lx_raw.data[i];
+					EEPROM.write(EEPROM_BULB_LOCATION_START + i, bulbLocation.lx_raw.data[i]);
+				}
+			}		
+			EEPROM.commit();
+			if(!request.lx_protocol_header.res_required) return;
+		case GET_LOCATION:
+			response.lx_protocol_header.type = STATE_LOCATION;
+			
+			memcpy(response.lx_protocol_header.data, bulbLocation.lx_raw.data, sizeof(LifxLocationData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxLocationData);
+			sendPacket(response);				
+			break;			
 
-    case SET_BULB_LABEL:
-    case GET_BULB_LABEL:
-      {
-        // set if we are setting
-        if (request.packet_type == SET_BULB_LABEL) {
-          for (int i = 0; i < LifxBulbLabelLength; i++) {
-            if (bulbLabel[i] != request.data[i]) {
-              bulbLabel[i] = request.data[i];
-              EEPROM.write(EEPROM_BULB_LABEL_START + i, request.data[i]);
-            }
-          }
-        }
+		case SET_GROUP:
+			pgrpData = (LifxGroupData *)(request.lx_protocol_header.data);
+			
+			for (int i = 0; i < sizeof(LifxGroupData); i++) {
+				if (bulbGroup.lx_raw.data[i] != pgrpData->lx_raw.data[i]) {
+					bulbGroup.lx_raw.data[i] = pgrpData->lx_raw.data[i];
+					EEPROM.write(EEPROM_BULB_LOCATION_START + i, bulbGroup.lx_raw.data[i]);
+				}
+			}
+			EEPROM.commit();			
+			if(!request.lx_protocol_header.res_required) return;		
+		case GET_GROUP:
+			response.lx_protocol_header.type = STATE_GROUP;
 
-        // respond to both get and set commands
-        response.packet_type = BULB_LABEL;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        memcpy(response.data, bulbLabel, sizeof(bulbLabel));
-        response.data_size = sizeof(bulbLabel);
-        sendPacket(response);
-      }
-      break;
+			memcpy(response.lx_protocol_header.data, bulbGroup.lx_raw.data, sizeof(LifxGroupData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxGroupData);
+			sendPacket(response);
+			break;
 
+		case SET_UNKNOWN:
+			puData = (LifxUnknownData *)(request.lx_protocol_header.data);
+			memcpy(unknownData.lx_raw.data, puData, sizeof(LifxUnknownData));
+			EEPROM.commit();
+			if(!request.lx_protocol_header.res_required) return;	
+		case GET_UNKNOWN:
+			response.lx_protocol_header.type = STATE_UNKNOWN;
 
-    case SET_BULB_TAGS:
-    case GET_BULB_TAGS:
-      {
-        // set if we are setting
-        if (request.packet_type == SET_BULB_TAGS) {
-          for (int i = 0; i < LifxBulbTagsLength; i++) {
-            if (bulbTags[i] != request.data[i]) {
-              bulbTags[i] = lowByte(request.data[i]);
-              EEPROM.write(EEPROM_BULB_TAGS_START + i, request.data[i]);
-            }
-          }
-        }
+			LifxUnknownData uData;
+			memcpy(&uData, unknownData.lx_raw.data, sizeof(LifxUnknownData));
+			memcpy(response.lx_protocol_header.data, uData.lx_raw.data, sizeof(LifxUnknownData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxUnknownData);
+			sendPacket(response);				
+			break;
+			
+		case ECHO_REQUEST:
+			response.lx_protocol_header.type = ECHO_RESPONSE;
 
-        // respond to both get and set commands
-        response.packet_type = BULB_TAGS;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        memcpy(response.data, bulbTags, sizeof(bulbTags));
-        response.data_size = sizeof(bulbTags);
-        sendPacket(response);
-      }
-      break;
+			memcpy(response.lx_protocol_header.data, request.lx_protocol_header.data, sizeof(LifxEchoData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxEchoData);
+			sendPacket(response);	
+			break;
 
+//LIGHT MESSAGES
+		case LIGHT_SET_COLOR:
+		case LIGHT_SET_WAVEFORM:
+		case LIGHT_SET_WAVEFORM_OPTIONAL:			
+			switch (request.lx_protocol_header.type) {
+				case LIGHT_SET_COLOR:
+					pscData = (LifxLightColorData *)(request.lx_protocol_header.data);
+					hue = pscData->lx_light_color.color.hue;
+					sat = pscData->lx_light_color.color.saturation;
+					bri = pscData->lx_light_color.color.brightness;
+					kel = pscData->lx_light_color.color.kelvin;
+					setLight();				
+					break;
+				case LIGHT_SET_WAVEFORM:
+					break;
+				case LIGHT_SET_WAVEFORM_OPTIONAL:	
+					pwoData = (LifxLightWaveformOptionalData *)(request.lx_protocol_header.data);
+					if(pwoData->lx_light_wavefom_optional.set_hue) hue = pwoData->lx_light_wavefom_optional.color.hue;
+					if(pwoData->lx_light_wavefom_optional.set_saturation) sat = pwoData->lx_light_wavefom_optional.color.saturation;
+					if(pwoData->lx_light_wavefom_optional.set_brightness) bri = pwoData->lx_light_wavefom_optional.color.brightness;
+					if(pwoData->lx_light_wavefom_optional.set_kelvin) kel = pwoData->lx_light_wavefom_optional.color.kelvin;
+					setLight();					
+					break;
+			}
+			if(!request.lx_protocol_header.res_required) return;			
+		case LIGHT_GET:
+			response.lx_protocol_header.type = LIGHT_STATE;
+			response.lx_protocol_header.origin = 1;
+			LifxLightStateData lsData;
+			memset(&lsData, 0, sizeof(lsData));
+			lsData.lx_light_state.color.hue = hue;
+			lsData.lx_light_state.color.saturation = sat;
+			lsData.lx_light_state.color.brightness = bri;
+			lsData.lx_light_state.color.kelvin = kel;
+			lsData.lx_light_state.power = power_status;
+			memcpy(lsData.lx_light_state.label, bulbLabel, LifxBulbLabelLength);
+			memcpy(response.lx_protocol_header.data, lsData.lx_raw.data, sizeof(LifxLightStateData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxLightStateData);
+			sendPacket(response);				
+			break;			
 
-    case SET_BULB_TAG_LABELS:
-    case GET_BULB_TAG_LABELS:
-      {
-        // set if we are setting
-        if (request.packet_type == SET_BULB_TAG_LABELS) {
-          for (int i = 0; i < LifxBulbTagLabelsLength; i++) {
-            if (bulbTagLabels[i] != request.data[i]) {
-              bulbTagLabels[i] = request.data[i];
-              EEPROM.write(EEPROM_BULB_TAG_LABELS_START + i, request.data[i]);
-            }
-          }
-        }
+		case LIGHT_SET_POWER:
+			plspData = (LifxLightSetPowerData *)(request.lx_protocol_header.data);
+			power_status = plspData->lx_light_set_power.level;
+			setLight();
+			EEPROM.commit();
+			if(!request.lx_protocol_header.res_required) return;
+		case LIGHT_GET_POWER:
+			response.lx_protocol_header.type = LIGHT_STATE_POWER;
 
-        // respond to both get and set commands
-        response.packet_type = BULB_TAG_LABELS;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        memcpy(response.data, bulbTagLabels, sizeof(bulbTagLabels));
-        response.data_size = sizeof(bulbTagLabels);
-        sendPacket(response);
-      }
-      break;
+			LifxLightPowerData lpData;
+			memset(&lpData, 0, sizeof(lpData));
+			lpData.lx_light_power.level = power_status;
+			memcpy(response.lx_protocol_header.data, lpData.lx_raw.data, sizeof(LifxLightPowerData));
+			response.lx_protocol_header.size = LifxHeaderSize + sizeof(LifxLightPowerData);
+			sendPacket(response);	
+			break;
 
+		case LIGHT_SET_IR:
+			if(!request.lx_protocol_header.res_required) return;
+		case LIGHT_GET_IR:
+			//LIGHT_STATE_IR = 118;
+			break;
 
-    case GET_VERSION_STATE:
-      {
-        // respond to get command
-        response.packet_type = VERSION_STATE;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        byte VersionData[] = {
-          lowByte(LifxBulbVendor),
-          highByte(LifxBulbVendor),
-          0x00,
-          0x00,
-          lowByte(LifxBulbProduct),
-          highByte(LifxBulbProduct),
-          0x00,
-          0x00,
-          lowByte(LifxBulbVersion),
-          highByte(LifxBulbVersion),
-          0x00,
-          0x00
-        };
-
-        memcpy(response.data, VersionData, sizeof(VersionData));
-        response.data_size = sizeof(VersionData);
-        sendPacket(response);
-
-        /*
-        // respond again to get command (real bulbs respond twice, slightly diff data (see below)
-        response.packet_type = VERSION_STATE;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        byte VersionData2[] = {
-          lowByte(LifxVersionVendor), //vendor stays the same
-          highByte(LifxVersionVendor),
-          0x00,
-          0x00,
-          lowByte(LifxVersionProduct*2), //product is 2, rather than 1
-          highByte(LifxVersionProduct*2),
-          0x00,
-          0x00,
-          0x00, //version is 0, rather than 1
-          0x00,
-          0x00,
-          0x00
-          };
-
-        memcpy(response.data, VersionData2, sizeof(VersionData2));
-        response.data_size = sizeof(VersionData2);
-        sendPacket(response);
-        */
-      }
-      break;
-
-
-    case GET_MESH_FIRMWARE_STATE:
-      {
-        // respond to get command
-        response.packet_type = MESH_FIRMWARE_STATE;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        // timestamp data comes from observed packet from a LIFX v1.5 bulb
-        byte MeshVersionData[] = {
-          0x00, 0x2e, 0xc3, 0x8b, 0xef, 0x30, 0x86, 0x13, //build timestamp
-          0xe0, 0x25, 0x76, 0x45, 0x69, 0x81, 0x8b, 0x13, //install timestamp
-          lowByte(LifxFirmwareVersionMinor),
-          highByte(LifxFirmwareVersionMinor),
-          lowByte(LifxFirmwareVersionMajor),
-          highByte(LifxFirmwareVersionMajor)
-        };
-
-        memcpy(response.data, MeshVersionData, sizeof(MeshVersionData));
-        response.data_size = sizeof(MeshVersionData);
-        sendPacket(response);
-      }
-      break;
-
-
-    case GET_WIFI_FIRMWARE_STATE:
-      {
-        // respond to get command
-        response.packet_type = WIFI_FIRMWARE_STATE;
-        response.protocol = LifxProtocol_AllBulbsResponse;
-        // timestamp data comes from observed packet from a LIFX v1.5 bulb
-        byte WifiVersionData[] = {
-          0x00, 0xc8, 0x5e, 0x31, 0x99, 0x51, 0x86, 0x13, //build timestamp
-          0xc0, 0x0c, 0x07, 0x00, 0x48, 0x46, 0xd9, 0x43, //install timestamp
-          lowByte(LifxFirmwareVersionMinor),
-          highByte(LifxFirmwareVersionMinor),
-          lowByte(LifxFirmwareVersionMajor),
-          highByte(LifxFirmwareVersionMajor)
-        };
-
-        memcpy(response.data, WifiVersionData, sizeof(WifiVersionData));
-        response.data_size = sizeof(WifiVersionData);
-        sendPacket(response);
-      }
-      break;
-
-
-    default:
-      {
-          debug_print(F("Unknown packet type: "));
-          debug_println(request.packet_type, DEC);
-      }
-      break;
-  }
+		default:
+			debug_print(F("Unknown packet type: "));
+			debug_println(request.lx_protocol_header.type, DEC);
+			break;
+	}
 }
 
 void sendPacket(LifxPacket &pkt) {
   sendUDPPacket(pkt);
+  LifxTxBytes += pkt.lx_protocol_header.size;
 
   if (client.connected()) {
     sendTCPPacket(pkt);
@@ -658,66 +722,11 @@ unsigned int sendUDPPacket(LifxPacket &pkt) {
   printLifxPacket(pkt);
   debug_println();
 
-  Udp.beginPacket(broadcast_addr, Udp.remotePort());
-
-  // size
-  Udp.write(lowByte(LifxPacketSize + pkt.data_size));
-  Udp.write(highByte(LifxPacketSize + pkt.data_size));
-
-  // protocol
-  Udp.write(lowByte(pkt.protocol));
-  Udp.write(highByte(pkt.protocol));
-
-  // reserved1
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-
-  // bulbAddress mac address
-  for (int i = 0; i < sizeof(mac); i++) {
-    Udp.write(lowByte(mac[i]));
-  }
-
-  // reserved2
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-
-  // site mac address
-  for (int i = 0; i < sizeof(site_mac); i++) {
-    Udp.write(lowByte(site_mac[i]));
-  }
-
-  // reserved3
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-
-  // timestamp
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-
-  //packet type
-  Udp.write(lowByte(pkt.packet_type));
-  Udp.write(highByte(pkt.packet_type));
-
-  // reserved4
-  Udp.write(lowByte(0x00));
-  Udp.write(lowByte(0x00));
-
-  //data
-  for (int i = 0; i < pkt.data_size; i++) {
-    Udp.write(lowByte(pkt.data[i]));
-  }
-
+  Udp.beginPacket(remote_addr, Udp.remotePort());
+  Udp.write(pkt.lx_raw.data, pkt.lx_protocol_header.size);
   Udp.endPacket();
 
-  return LifxPacketSize + pkt.data_size;
+  return pkt.lx_protocol_header.size;
 }
 
 unsigned int sendTCPPacket(LifxPacket &pkt) {
@@ -726,152 +735,15 @@ unsigned int sendTCPPacket(LifxPacket &pkt) {
   printLifxPacket(pkt);
   debug_println();
 
-  byte TCPBuffer[128]; //buffer to hold outgoing packet,
-  int byteCount = 0;
-
-  // size
-  TCPBuffer[byteCount++] = lowByte(LifxPacketSize + pkt.data_size);
-  TCPBuffer[byteCount++] = highByte(LifxPacketSize + pkt.data_size);
-
-  // protocol
-  TCPBuffer[byteCount++] = lowByte(pkt.protocol);
-  TCPBuffer[byteCount++] = highByte(pkt.protocol);
-
-  // reserved1
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-
-  // bulbAddress mac address
-  for (int i = 0; i < sizeof(mac); i++) {
-    TCPBuffer[byteCount++] = lowByte(mac[i]);
-  }
-
-  // reserved2
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-
-  // site mac address
-  for (int i = 0; i < sizeof(site_mac); i++) {
-    TCPBuffer[byteCount++] = lowByte(site_mac[i]);
-  }
-
-  // reserved3
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-
-  // timestamp
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-
-  //packet type
-  TCPBuffer[byteCount++] = lowByte(pkt.packet_type);
-  TCPBuffer[byteCount++] = highByte(pkt.packet_type);
-
-  // reserved4
-  TCPBuffer[byteCount++] = lowByte(0x00);
-  TCPBuffer[byteCount++] = lowByte(0x00);
-
-  //data
-  for (int i = 0; i < pkt.data_size; i++) {
-    TCPBuffer[byteCount++] = lowByte(pkt.data[i]);
-  }
-
-  //client.write(TCPBuffer, byteCount);
-
-  return LifxPacketSize + pkt.data_size;
+  return pkt.lx_protocol_header.size;
 }
 
 // print out a LifxPacket data structure as a series of hex bytes - used for DEBUG
 void printLifxPacket(LifxPacket &pkt) {
-  // size
-  debug_print(lowByte(LifxPacketSize + pkt.data_size), HEX);
-  debug_print(SPACE);
-  debug_print(highByte(LifxPacketSize + pkt.data_size), HEX);
-  debug_print(SPACE);
-
-  // protocol
-  debug_print(lowByte(pkt.protocol), HEX);
-  debug_print(SPACE);
-  debug_print(highByte(pkt.protocol), HEX);
-  debug_print(SPACE);
-
-  // reserved1
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-
-  // bulbAddress mac address
-  for (int i = 0; i < sizeof(mac); i++) {
-    debug_print(lowByte(mac[i]), HEX);
-    debug_print(SPACE);
-  }
-
-  // reserved2
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-
-  // site mac address
-  for (int i = 0; i < sizeof(site_mac); i++) {
-    debug_print(lowByte(site_mac[i]), HEX);
-    debug_print(SPACE);
-  }
-
-  // reserved3
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-
-  // timestamp
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-
-  //packet type
-  debug_print(lowByte(pkt.packet_type), HEX);
-  debug_print(SPACE);
-  debug_print(highByte(pkt.packet_type), HEX);
-  debug_print(SPACE);
-
-  // reserved4
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-  debug_print(lowByte(0x00), HEX);
-  debug_print(SPACE);
-
-  //data
-  for (int i = 0; i < pkt.data_size; i++) {
-    debug_print(pkt.data[i], HEX);
-    debug_print(SPACE);
-  }
+	for (int i = 0; i < pkt.lx_protocol_header.size; i++) {
+		debug_print(pkt.lx_raw.data[i], HEX);
+		debug_print(SPACE);
+	}
 }
 
 void setLight() {
@@ -887,9 +759,10 @@ void setLight() {
   debug_print(F(", power: "));
   debug_print(power_status);
   debug_println(power_status ? " (on)" : "(off)");
-
+  uint8_t white = 0;
   if (power_status) {
-    int this_hue = map(hue, 0, 65535, 0, 767);
+    //int this_hue = map(hue, 0, 65535, 0, 767);
+	int this_hue = map(hue, 0, 65535, 0, 359);
     int this_sat = map(sat, 0, 65535, 0, 255);
     int this_bri = map(bri, 0, 65535, 0, 255);
     
@@ -904,26 +777,32 @@ void setLight() {
       kelvin_hsv = rgb2hsv(kelvin_rgb);
 
       // set the new values ready to go to the bulb (brightness does not change, just hue and saturation)
-      this_hue = map(kelvin_hsv.h, 0, 359, 0, 767);
+      //this_hue = map(kelvin_hsv.h, 0, 359, 0, 767);
+	  this_hue = map(kelvin_hsv.h, 0, 359, 0, 359);
       this_sat = map(kelvin_hsv.s * 1000, 0, 1000, 0, 255); //multiply the sat by 1000 so we can map the percentage value returned by rgb2hsv
+	  white =  this_bri;
     }
 
-    uint8_t rgbColor[3];
-    hsb2rgb(this_hue, this_sat, this_bri, rgbColor);
 
-    uint8_t r = map(rgbColor[0], 0, 255, 0, 32);
-    uint8_t g = map(rgbColor[1], 0, 255, 0, 32);
-    uint8_t b = map(rgbColor[2], 0, 255, 0, 32);
-    
+	uint8_t r2, g2, b2;
+    hsb2rgb2(this_hue, this_sat, this_bri, r2, g2, b2);
+	  debug_print(F("r: "));
+	  debug_print(r2);
+	  debug_print(F(", g: "));
+	  debug_print(g2);
+	  debug_print(F(", b: "));
+	  debug_println(b2);;
+	
     // LIFXBulb.fadeHSB(this_hue, this_sat, this_bri);
-    led_strip.setPixelColor (0, r, g, b);
+    led_strip.ClearTo(RgbwColor(g2, r2, b2, white));
   }
   else {
 
     // LIFXBulb.fadeHSB(0, 0, 0);
-    led_strip.setPixelColor (0, 0, 0, 0);
+    led_strip.ClearTo(RgbwColor (0, 0, 0, 0));
   }
-  led_strip.show ();
+  //led_strip.ClearTo(RgbwColor(0, 0, 0, 64));
+  led_strip.Show ();
 }
 
 /******************************************************************************
@@ -938,6 +817,7 @@ void setLight() {
  *****************************************************************************/
 void hsb2rgb(uint16_t index, uint8_t sat, uint8_t bright, uint8_t color[3])
 {
+	
   uint16_t r_temp, g_temp, b_temp;
   uint8_t index_mod;
   uint8_t inverse_sat = (sat ^ 255);
@@ -986,6 +866,61 @@ void hsb2rgb(uint16_t index, uint8_t sat, uint8_t bright, uint8_t color[3])
   color[2] = (uint8_t)b_temp;
 }
 
+void hsb2rgb2(uint16_t hue, uint16_t sat, uint16_t val, uint8_t& red, uint8_t& green, uint8_t& blue) {
+  val = dc1[val];
+  sat = 255-dc1[255-sat];
+  hue = hue % 360;
 
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+  uint8_t base;
 
+  if (sat == 0) { // Acromatic color (gray). Hue doesn't mind.
+    red   = val;
+    green = val;
+    blue  = val;
+  } else  {
+    base = ((255 - sat) * val)>>8;
+    switch(hue/60) {
+      case 0:
+		    r = val;
+        g = (((val-base)*hue)/60)+base;
+        b = base;
+        break;
+	
+      case 1:
+        r = (((val-base)*(60-(hue%60)))/60)+base;
+        g = val;
+        b = base;
+        break;
+	
+      case 2:
+        r = base;
+        g = val;
+        b = (((val-base)*(hue%60))/60)+base;
+        break;
 
+      case 3:
+        r = base;
+        g = (((val-base)*(60-(hue%60)))/60)+base;
+        b = val;
+        break;
+	
+      case 4:
+        r = (((val-base)*(hue%60))/60)+base;
+        g = base;
+        b = val;
+        break;
+	
+      case 5:
+        r = val;
+        g = base;
+        b = (((val-base)*(60-(hue%60)))/60)+base;
+        break;
+    }  
+    red   = r;
+    green = g;
+    blue  = b; 
+  }
+}
